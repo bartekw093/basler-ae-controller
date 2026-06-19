@@ -4,6 +4,9 @@ basler_auto_exposure.py
 Plug-and-play kontroler auto-exposure / auto-gain dla kamer Basler (pypylon),
 zaprojektowany pod stałe FPS (np. 25fps) z ograniczeniem czasowym na ExposureTime.
 
+Zoptymalizowany pod pracę NA ZEWNĄTRZ 24/7: od nocy (długa ekspozycja + gain)
+po ostre słońce (krótka ekspozycja, gain 0) i prześwietlenie dużej części kadru.
+
 Użycie minimalne:
 
     from pypylon import pylon
@@ -24,19 +27,24 @@ Użycie minimalne:
             ... # dalsze przetwarzanie
         grab_result.Release()
 
+Dla trudnego outdooru zalecany jest tryb SOFTWARE (prefer_native_ae=False),
+bo regulator software ma ochronę highlightów - native AE Baslera celuje w
+średnią i potrafi spalić niebo albo zrobić noc zbyt ciemną.
+
 Działa z dowolną aplikacją bo:
 - nie zakłada żadnego konkretnego pipeline'u przetwarzania obrazu
 - automatycznie wykrywa czy kamera ma ExposureAuto/GainAuto i preferuje native AE
-- fallback na software PI-loop jeśli native AE nie jest dostępny lub explicite wyłączony
+- fallback na software loop (regulacja multiplikatywna w domenie log + ochrona highlightów)
 - wszystkie parametry konfigurowalne przez dataclass AEConfig
 - bezpieczne wobec błędów GenICam (nie wywala pipeline'u przy okazjonalnym rzucie wyjątku)
 """
 
 from __future__ import annotations
 
+import math
 import logging
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, Literal, Tuple
 
 import numpy as np
 
@@ -47,6 +55,8 @@ except ImportError:
 
 logger = logging.getLogger("basler_auto_exposure")
 
+_LN2 = math.log(2.0)
+
 
 @dataclass
 class AEConfig:
@@ -54,37 +64,55 @@ class AEConfig:
 
     # --- Cel regulacji ---
     target_fps: float = 25.0
-    target_brightness: float = 128.0      # cel w skali 0-255 (jeśli obraz 16-bit, normalizujemy wewnętrznie)
-    tolerance: float = 5.0                # martwa strefa wokół celu - zapobiega "drganiu"
+    target_brightness: float = 110.0      # cel w skali 0-255; nieco poniżej środka -> bezpieczniej dla highlightów
+    tolerance: float = 6.0                # martwa strefa wokół celu (skala 0-255) - zapobiega "drganiu"
     brightness_metric: Literal["mean", "percentile"] = "mean"
-    percentile: float = 95.0              # używane gdy brightness_metric == "percentile"
+    percentile: float = 50.0              # używane gdy brightness_metric == "percentile" (mediana = odporna na clipping)
 
     # --- Limity exposure (w mikrosekundach) ---
     exposure_safety_margin_us: float = 2000.0  # margines na readout/transfer poniżej okresu ramki
-    min_exposure_us: float = 100.0
+    min_exposure_us: float = 50.0         # niżej -> obrona przed prześwietleniem w ostrym słońcu
     max_exposure_us: Optional[float] = None     # None = wyliczane automatycznie z target_fps
 
     # --- Limity gain (jednostki zależne od kamery - zwykle dB) ---
     min_gain: float = 0.0
     max_gain: Optional[float] = None      # None = czyta z kamery (GainMax)
+    gain_is_db: bool = True               # True: Gain w dB (typowe Basler ace); False: jednostki liniowe
 
     # --- Tryb pracy ---
     prefer_native_ae: bool = True         # jeśli kamera wspiera ExposureAuto/GainAuto - użyj go
     # Różne modele Baslera używają różnych stringów dla AutoFunctionProfile -
-    # próbujemy po kolei aż któryś zostanie zaakceptowany. "MinimizeGain" oznacza
-    # priorytet exposure nad gainem (mniej szumu).
+    # próbujemy po kolei aż któryś zostanie zaakceptowany. "MinimizeGain" = priorytet exposure (mniej szumu).
     native_auto_function_profiles: tuple = ("MinimizeGain", "Gain", "GainMinimum")
 
-    # Twarde wymuszenie FPS - bez tego Basler niekoniecznie utrzymuje stałą
-    # częstotliwość klatek; ograniczenie samego exposure to za mało.
+    # Twarde wymuszenie FPS - bez tego Basler niekoniecznie utrzymuje stałą częstotliwość.
     enforce_frame_rate: bool = True
 
-    # --- Parametry software PI-loop (używane tylko gdy native AE niedostępny) ---
-    kp_exposure: float = 60.0             # wzmocnienie proporcjonalne -> us na jednostkę błędu jasności
-    kp_gain: float = 0.08                 # wzmocnienie proporcjonalne -> dB na jednostkę błędu jasności
-    ki: float = 0.0                       # człon całkujący (0 = czysty P, włącz jeśli zostaje stały offset)
-    update_every_n_frames: int = 3        # nie regulować co frame - tłumi drgania
-    max_step_fraction: float = 0.25       # max zmiana exposure/gain na krok jako % zakresu (anti-windup/szarpanie)
+    # --- Regulator software (używany gdy native AE niedostępny / wyłączony) ---
+    update_every_n_frames: int = 2        # co ile ramek liczyć krok regulacji
+    ema_alpha: float = 0.4                # wygładzanie pomiaru jasności (0-1; mniej = gładziej, wolniej)
+    max_step_ev_up: float = 0.7           # max krok rozjaśniania na iterację [EV/stops]
+    max_step_ev_down: float = 2.0         # max krok ciemnienia [EV] - większy, bo highlighty są groźniejsze
+
+    # --- Metering: balans highlightów i cieni (sceny o wysokim kontraście) ---
+    # "global"   = regulacja do średniej + ochrona highlightów
+    # "balanced" = szukanie równowagi między spalonymi highlightami a zatopionymi cieniami
+    #              (np. jednocześnie słońce i głęboki cień w jednym kadrze)
+    metering: Literal["global", "balanced"] = "balanced"
+
+    # Highlighty (spalone niebo / słońce)
+    saturation_threshold: float = 250.0   # piksel >= tej wartości (skala 0-255) liczony jako nasycony
+    max_saturated_fraction: float = 0.02  # dopuszczalny udział nasyconych pikseli (2%)
+    highlight_recovery_gain: float = 6.0  # jak agresywnie ciemnieć przy nadmiarze highlightów
+
+    # Cienie (zatopiona czerń)
+    shadow_threshold: float = 16.0        # piksel <= tej wartości liczony jako zatopiony cień
+    max_shadow_fraction: float = 0.10     # dopuszczalny udział pikseli w cieniu (10%)
+    shadow_recovery_gain: float = 4.0     # jak agresywnie rozjaśniać przy nadmiarze cieni
+
+    # Przy nieuniknionym dwustronnym clippingu (HDR) - ile razy ważniejsza jest
+    # ochrona highlightów niż cieni przy szukaniu kompromisu.
+    highlight_priority: float = 2.5
 
     # --- Pomiar jasności / głębia bitowa ---
     bit_depth: Optional[int] = None       # None = autodetekcja z PixelSize (fallback 8-bit)
@@ -99,7 +127,12 @@ class AutoExposureController:
     Kontroler auto-exposure/gain dla kamery Basler (pypylon).
 
     Automatycznie wybiera między natywnym AE kamery (ExposureAuto/GainAuto)
-    a software PI-loop, w zależności od dostępności node'ów i konfiguracji.
+    a software loop, w zależności od dostępności node'ów i konfiguracji.
+
+    Software loop reguluje multiplikatywnie w domenie logarytmicznej: traktuje
+    iloczyn (czas_ekspozycji * gain_liniowy) jako wspólny "budżet światła",
+    skaluje go przez (target / zmierzona_jasność) i rozkłada z powrotem -
+    najpierw na czas (mało szumu), nadwyżkę na gain (noc).
     """
 
     def __init__(self, camera, config: Optional[AEConfig] = None):
@@ -107,7 +140,7 @@ class AutoExposureController:
         self.cfg = config or AEConfig()
         self._mode: Literal["native", "software", "disabled"] = "disabled"
         self._frame_count = 0
-        self._integral_error = 0.0
+        self._brightness_ema: Optional[float] = None
         self._max_exposure_us = self.cfg.max_exposure_us
         self._max_gain = self.cfg.max_gain
         self._bit_depth_scale: Optional[float] = None  # przelicznik do skali 0-255, ustalany w start()
@@ -131,7 +164,7 @@ class AutoExposureController:
         else:
             self._start_software_loop_prereqs()
             self._mode = "software"
-            logger.info("AutoExposureController: tryb SOFTWARE (PI-loop)")
+            logger.info("AutoExposureController: tryb SOFTWARE (regulacja log + ochrona highlightów)")
 
         return self._mode
 
@@ -150,7 +183,7 @@ class AutoExposureController:
         """
         Wywołuj raz na każdy odebrany frame. W trybie native jest to no-op
         (kamera reguluje się sama w firmware). W trybie software wykonuje
-        krok regulacji PI co `update_every_n_frames` ramek.
+        krok regulacji co `update_every_n_frames` ramek.
         """
         if self._mode != "software":
             return  # native AE robi to sam w hardware; disabled -> nic nie robimy
@@ -213,7 +246,7 @@ class AutoExposureController:
         self._safe_set(cam.GainAuto, "Continuous")
 
     # ------------------------------------------------------------------ #
-    # Software PI-loop
+    # Software loop (regulacja multiplikatywna w domenie log)
     # ------------------------------------------------------------------ #
 
     def _start_software_loop_prereqs(self):
@@ -225,53 +258,124 @@ class AutoExposureController:
             self._safe_set(cam.GainAuto, "Off")
 
         # Start od bezpiecznych wartości
-        self._safe_set(cam.ExposureTime, min(self._max_exposure_us, 10000.0))
+        self._safe_set(cam.ExposureTime, min(self._max_exposure_us, 5000.0))
         if hasattr(cam, "Gain"):
             self._safe_set(cam.Gain, self.cfg.min_gain)
 
     def _software_step(self, img_array: np.ndarray):
         cam = self.camera
-        brightness = self._measure_brightness(img_array)
-        error = self.cfg.target_brightness - brightness
+        brightness, hi_fraction, lo_fraction = self._measure(img_array)
 
-        if abs(error) < self.cfg.tolerance:
-            self._integral_error = 0.0  # reset całki w martwej strefie
+        # Wygładzanie czasowe - tłumi migotanie (reflektory, przejeżdżające auta).
+        if self._brightness_ema is None:
+            self._brightness_ema = brightness
+        else:
+            a = self.cfg.ema_alpha
+            self._brightness_ema = a * brightness + (1.0 - a) * self._brightness_ema
+        smoothed = self._brightness_ema
+
+        hi_excess = max(0.0, hi_fraction - self.cfg.max_saturated_fraction)
+        lo_excess = max(0.0, lo_fraction - self.cfg.max_shadow_fraction)
+        clipping_active = (hi_excess > 0.0) or (lo_excess > 0.0)
+
+        # Martwa strefa: blisko celu i bez nadmiaru clippingu -> nie ruszamy nic.
+        if not clipping_active and abs(smoothed - self.cfg.target_brightness) < self.cfg.tolerance:
             return
 
-        self._integral_error += error
+        # Pożądana korekta budżetu światła w domenie log (EV w jednostkach naturalnych).
+        log_ratio = self._compute_log_ratio(smoothed, hi_excess, lo_excess)
 
+        # Ograniczenie kroku w domenie log (EV). Asymetryczne: szybciej ciemniej.
+        max_up = self.cfg.max_step_ev_up * _LN2
+        max_down = self.cfg.max_step_ev_down * _LN2
+        log_ratio = max(-max_down, min(max_up, log_ratio))
+        ratio = math.exp(log_ratio)
+
+        # Budżet światła = czas * gain_liniowy.
+        has_gain = hasattr(cam, "Gain")
         current_exp = cam.ExposureTime.GetValue()
-        current_gain = cam.Gain.GetValue() if hasattr(cam, "Gain") else 0.0
+        current_gain = cam.Gain.GetValue() if has_gain else self.cfg.min_gain
+        lin_gain_min = self._gain_to_linear(self.cfg.min_gain)
+        lin_gain_max = self._gain_to_linear(self._max_gain) if has_gain else lin_gain_min
+        current_total = current_exp * self._gain_to_linear(current_gain)
+        new_total = current_total * ratio
 
-        exp_correction = self.cfg.kp_exposure * error + self.cfg.ki * self._integral_error
-        exp_step_limit = self.cfg.max_step_fraction * self._max_exposure_us
-        exp_correction = float(np.clip(exp_correction, -exp_step_limit, exp_step_limit))
+        # Rozkład budżetu: najpierw maksymalizuj czas przy minimalnym gainie
+        # (najmniej szumu), nadwyżkę dopiero przerzuć na gain (noc).
+        desired_exp = new_total / lin_gain_min
+        new_exp = float(np.clip(desired_exp, self.cfg.min_exposure_us, self._max_exposure_us))
+        self._safe_set(cam.ExposureTime, new_exp)
 
-        new_exp = current_exp + exp_correction
-        new_exp_clamped = float(np.clip(new_exp, self.cfg.min_exposure_us, self._max_exposure_us))
-        self._safe_set(cam.ExposureTime, new_exp_clamped)
-
-        # Gain: podbijamy gdy exposure jest przy suficie (ciemno), a redukujemy gdy
-        # exposure ma zapas a gain jest niezerowy (scena się rozjaśniła) -> mniej szumu.
-        at_exposure_ceiling = new_exp_clamped >= self._max_exposure_us - 1.0
-        has_headroom = new_exp_clamped <= self.cfg.min_exposure_us + 1.0
-
-        if hasattr(cam, "Gain") and (at_exposure_ceiling or (has_headroom and current_gain > self.cfg.min_gain)):
-            gain_correction = self.cfg.kp_gain * error
-            gain_step_limit = self.cfg.max_step_fraction * (self._max_gain - self.cfg.min_gain)
-            gain_correction = float(np.clip(gain_correction, -gain_step_limit, gain_step_limit))
-            new_gain = float(np.clip(current_gain + gain_correction, self.cfg.min_gain, self._max_gain))
+        if has_gain:
+            needed_lin_gain = new_total / max(new_exp, 1e-6)
+            new_lin_gain = float(np.clip(needed_lin_gain, lin_gain_min, lin_gain_max))
+            new_gain = self._linear_to_gain(new_lin_gain)
             self._safe_set(cam.Gain, new_gain)
 
-    def _measure_brightness(self, img_array: np.ndarray) -> float:
-        # Podpróbkowanie - do regulacji AE w zupełności wystarcza, znacznie taniej.
+    def _compute_log_ratio(self, smoothed: float, hi_excess: float, lo_excess: float) -> float:
+        """
+        Wylicza pożądaną korektę budżetu światła (log naturalny; >0 = jaśniej, <0 = ciemniej).
+
+        Idea balansu:
+        - bez nadmiernego clippingu -> klasyczna regulacja do średniej (target_brightness),
+        - nadmiar highlightów -> górne ograniczenie: WYMUSZ co najmniej tyle ciemnienia,
+        - nadmiar cieni       -> dolne ograniczenie: WYMUSZ co najmniej tyle rozjaśnienia,
+        - oba naraz (HDR, clipping nieunikniony) -> żądania są sprzeczne, więc bierzemy
+          kompromis ważony priorytetem highlightów. To właśnie "znalezienie balansu":
+          ekspozycja siada między spaleniem bieli a zatopieniem czerni.
+        """
+        cfg = self.cfg
+        base = math.log(cfg.target_brightness / max(smoothed, 1.0))
+
+        if cfg.metering == "global":
+            # Tylko ochrona highlightów (bez balansu cieni).
+            if hi_excess > 0.0:
+                base = min(base, -cfg.highlight_recovery_gain * hi_excess)
+            return base
+
+        # metering == "balanced"
+        upper = math.inf   # górny limit log_ratio (highlighty pchają w dół)
+        lower = -math.inf  # dolny limit log_ratio (cienie pchają w górę)
+        if hi_excess > 0.0:
+            upper = -cfg.highlight_recovery_gain * hi_excess
+        if lo_excess > 0.0:
+            lower = cfg.shadow_recovery_gain * lo_excess
+
+        if lower > upper:
+            # Sprzeczność (dwustronny clipping) -> kompromis ważony.
+            w = cfg.highlight_priority
+            return (w * upper + lower) / (w + 1.0)
+
+        return float(np.clip(base, lower, upper))
+
+    def _measure(self, img_array: np.ndarray) -> Tuple[float, float, float]:
+        """Zwraca (jasność 0-255, udział highlightów 0-1, udział cieni 0-1)."""
         step = max(1, self.cfg.brightness_subsample)
         sub = img_array[::step, ::step]
         arr = sub.astype(np.float32) * (self._bit_depth_scale or 1.0)
 
         if self.cfg.brightness_metric == "mean":
-            return float(np.mean(arr))
-        return float(np.percentile(arr, self.cfg.percentile))
+            brightness = float(np.mean(arr))
+        else:
+            brightness = float(np.percentile(arr, self.cfg.percentile))
+
+        hi_fraction = float(np.mean(arr >= self.cfg.saturation_threshold))
+        lo_fraction = float(np.mean(arr <= self.cfg.shadow_threshold))
+        return brightness, hi_fraction, lo_fraction
+
+    # ------------------------------------------------------------------ #
+    # Konwersje gain
+    # ------------------------------------------------------------------ #
+
+    def _gain_to_linear(self, gain: float) -> float:
+        if self.cfg.gain_is_db:
+            return 10.0 ** (gain / 20.0)
+        return max(gain, 1e-6)
+
+    def _linear_to_gain(self, lin: float) -> float:
+        if self.cfg.gain_is_db:
+            return 20.0 * math.log10(max(lin, 1e-6))
+        return lin
 
     # ------------------------------------------------------------------ #
     # Limity / helpers
